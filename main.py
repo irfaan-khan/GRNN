@@ -1,169 +1,338 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-import yfinance as yf
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import seaborn as sns
+from sklearn.metrics import roc_curve, auc, f1_score, confusion_matrix
+import os
+import sys
 
-# Parameters
-input_size = 5  # Number of input features
-hidden_size = 128  # Number of hidden units
-num_layers = 2  # Number of RNN layers
-output_size = 1  # Number of output features
-seq_length = 5  # Sequence length
-learning_rate = 0.001
-num_epochs = 1000
-batch_size = 64
-dropout = 0.2
-patience = 5
+from GSGD_RNN.train import train_and_evaluate as train_gsgd_rnn
+from RNN.train import train_and_evaluate as train_rnn
+from LSTM.train import train_and_evaluate as train_lstm
 
-# Download and preprocess data
-data = yf.download('GOOGL', start='2015-01-01', end='2018-01-01')
-data = data[['Open', 'High', 'Low', 'Close', 'Volume']]
-scaler = StandardScaler()
-data_normalized = scaler.fit_transform(data)
+class DualLogger:
+    def __init__(self, filepath):
+        self.console = sys.stdout
+        self.file = open(filepath, 'w')
 
-# Fit a separate StandardScaler for 'Close' prices
-close_scaler = StandardScaler()
-close_prices = data[['Close']]
-close_scaler.fit(close_prices)
+    def write(self, message):
+        self.console.write(message)
+        self.file.write(message)
 
-# Prepare data for training
-X = []
-y = []
-for i in range(len(data_normalized) - seq_length):
-    X.append(data_normalized[i:i+seq_length])
-    y.append(data_normalized[i+seq_length][3])  # Close price is at index 3
-X = np.array(X)
-y = np.array(y)
+    def flush(self):
+        self.console.flush()
+        self.file.flush()
 
-# Split data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+def plot_roc_curve(y_test, predicted_probabilities, label):
+    fpr, tpr, _ = roc_curve(y_test, predicted_probabilities)
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f'{label} (AUC = {roc_auc:.2f})')
+    return roc_auc
 
-# Convert data to PyTorch tensors
-X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+def save_results_to_csv(results, filepath):
+    import pandas as pd
+    df = pd.DataFrame(results)
+    df.to_csv(filepath, index=False)
 
-# Create DataLoader
-train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+def save_results_to_html(results, filepath):
+    import pandas as pd
+    df = pd.DataFrame(results)
+    df.to_html(filepath, index=False)
 
-# Define RNN model with dropout
-class RNN(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout):
-        super(RNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
+def plot_results_table(results, filepath):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from pandas.plotting import table
 
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).cuda()
-        out, _ = self.rnn(x, h0)
-        out = self.fc(out[:, -1, :])
-        return out
+    df = pd.DataFrame(results)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.axis('tight')
+    ax.axis('off')
+    tbl = table(ax, df, loc='center', cellLoc='center', colWidths=[0.1] * len(df.columns))
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1.2, 1.2)
+    plt.savefig(filepath)
 
-
-# Define GSGD optimizer
-class GSGD(torch.optim.Optimizer):
-    def __init__(self, params, lr, alpha, beta):
-        defaults = dict(lr=lr, alpha=alpha, beta=beta)
-        super(GSGD, self).__init__(params, defaults)
-
-    def step(self):
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data      # Compute the gradient of the loss function
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['v'] = torch.zeros_like(p.data) # Running average of the Gradient
-                    state['g'] = torch.zeros_like(p.data) # Squared Gradient
-
-                v = state['v']
-                g = state['g']
-
-                state['step'] += 1
-                lr = group['lr']
-                alpha = group['alpha'] # Decay rates
-                beta = group['beta']   # Decay rates
-
-                v = alpha * v + (1 - alpha) * grad
-                g = beta * g + (1 - beta) * grad**2
-
-                p.data -= lr * v / (torch.sqrt(g) + 1e-8)
-
-# Initialize model, loss function, and optimizer
-model = RNN(input_size, hidden_size, num_layers, output_size, dropout).cuda()
-criterion = nn.MSELoss()
-optimizer = GSGD(model.parameters(), lr=learning_rate, alpha=0.99, beta=0.999)  # Adjust alpha and beta as needed
-
-
-# Training loop with early stopping
-best_loss = float('inf')
-counter = 0
-for epoch in range(num_epochs):
-    model.train()
-    for i, (inputs, labels) in enumerate(train_loader):
-        inputs, labels = inputs.cuda(), labels.cuda()
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels.unsqueeze(1))
-        loss.backward()
-        optimizer.step()
-
-    # Validation
-    model.eval()
-    with torch.no_grad():
-        outputs = model(X_test_tensor.cuda())
-        loss = criterion(outputs, y_test_tensor.unsqueeze(1).cuda()).item()
-        if loss < best_loss:
-            best_loss = loss
-            counter = 0
+def pad_sequences(sequences, maxlen):
+    padded_sequences = np.zeros((len(sequences), maxlen), dtype=np.float32)
+    for i, seq in enumerate(sequences):
+        if isinstance(seq, list):
+            seq = np.concatenate([np.array(subseq, dtype=np.float32).flatten() for subseq in seq])
         else:
-            counter += 1
+            seq = np.array(seq, dtype=np.float32).flatten()
+        padded_sequences[i, :min(len(seq), maxlen)] = seq[:maxlen]
+    return padded_sequences
 
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss}')
+def main():
+    input_size = 8
+    hidden_size = 128
+    num_layers = 2
+    output_size = 1
+    seq_length = 5
+    learning_rate = 0.001
+    num_epochs = 200
+    batch_size = 64
+    dropout = 0.2
+    patience = 5
+    k_folds = 10
+    test_size = 0.1
 
-    # Early stopping
-    #if counter >= patience:
-    #    print('Early stopping...')
-    #    break
+    data_file = 'data/GOOGL_data.csv'
+    start_date = '2006-01-01'
+    end_date = '2021-01-01'
+    ticker = 'GOOGL'
 
-model.eval()
-with torch.no_grad():
-    outputs = model(X_test_tensor.cuda())
-    predicted = outputs.cpu().numpy()
+    total_runs = 30
 
-# Inverse transform to get actual values
-predicted = predicted.reshape(-1, output_size)
-predicted = close_scaler.inverse_transform(predicted)
-y_test = y_test.reshape(-1, 1)
-y_test = close_scaler.inverse_transform(y_test)
+    accuracies_gsgd_rnn = []
+    f1_scores_gsgd_rnn = []
+    roc_aucs_gsgd_rnn = []
+    predictions_gsgd_rnn = []
 
-# Calculate MAE and RMSE
-mae = mean_absolute_error(y_test, predicted)
-rmse = np.sqrt(mean_squared_error(y_test, predicted))
+    accuracies_rnn = []
+    f1_scores_rnn = []
+    roc_aucs_rnn = []
+    predictions_rnn = []
 
-# Calculate custom accuracy: percentage of predictions close to actual value
-threshold = 1.0  # Define your own threshold
-accurate_predictions = np.abs(predicted - y_test) < threshold
-accuracy = np.mean(accurate_predictions)
+    accuracies_lstm = []
+    f1_scores_lstm = []
+    roc_aucs_lstm = []
+    predictions_lstm = []
 
-print(f'MAE: {mae}, RMSE: {rmse}, Accuracy: {accuracy * 100}%')
+    actual_values = None
+    all_train_losses = []
+    all_val_losses = []
 
-# Plot actual vs predicted
-plt.figure(figsize=(12, 6))
-plt.plot(y_test, label='Actual')
-plt.plot(predicted, label='Predicted')
-plt.legend()
-plt.show()
+    results_dir = 'results'
+    os.makedirs(results_dir, exist_ok=True)
+
+    log_file_path = os.path.join(results_dir, 'logs.txt')
+    sys.stdout = DualLogger(log_file_path)
+
+    for run in range(1, total_runs + 1):
+        message = f'Run {run}/{total_runs}\n'
+        print(message)
+
+        accuracy_gsgd_rnn, predicted_gsgd_rnn, y_test, f1_gsgd_rnn, roc_auc_gsgd_rnn, train_losses, val_losses = train_gsgd_rnn(
+            ticker, data_file, start_date, end_date, input_size, hidden_size, num_layers, output_size, seq_length,
+            dropout,
+            learning_rate, num_epochs, batch_size, patience, k_folds, test_size, run
+        )
+        accuracies_gsgd_rnn.append(accuracy_gsgd_rnn)
+        f1_scores_gsgd_rnn.append(f1_gsgd_rnn)
+        roc_aucs_gsgd_rnn.append(roc_auc_gsgd_rnn)
+        predictions_gsgd_rnn.append(predicted_gsgd_rnn)
+        all_train_losses.append(train_losses)
+        all_val_losses.append(val_losses)
+
+        accuracy_rnn, predicted_rnn, y_test, f1_rnn, roc_auc_rnn, train_losses, val_losses = train_rnn(
+            ticker, data_file, start_date, end_date, input_size, hidden_size, num_layers, output_size, seq_length,
+            dropout,
+            learning_rate, num_epochs, batch_size, patience, k_folds, test_size, run
+        )
+        accuracies_rnn.append(accuracy_rnn)
+        f1_scores_rnn.append(f1_rnn)
+        roc_aucs_rnn.append(roc_auc_rnn)
+        predictions_rnn.append(predicted_rnn)
+        all_train_losses.append(train_losses)
+        all_val_losses.append(val_losses)
+
+        accuracy_lstm, predicted_lstm, y_test, f1_lstm, roc_auc_lstm, train_losses, val_losses = train_lstm(
+            ticker, data_file, start_date, end_date, input_size, hidden_size, num_layers, output_size, seq_length,
+            dropout,
+            learning_rate, num_epochs, batch_size, patience, k_folds, test_size, run
+        )
+        accuracies_lstm.append(accuracy_lstm)
+        f1_scores_lstm.append(f1_lstm)
+        roc_aucs_lstm.append(roc_auc_lstm)
+        predictions_lstm.append(predicted_lstm)
+        all_train_losses.append(train_losses)
+        all_val_losses.append(val_losses)
+
+        if actual_values is None:
+            actual_values = y_test
+
+    max_train_length = max(len(seq) for seq in all_train_losses)
+    max_val_length = max(len(seq) for seq in all_val_losses)
+
+    padded_train_losses = pad_sequences(all_train_losses, max_train_length)
+    padded_val_losses = pad_sequences(all_val_losses, max_val_length)
+
+    avg_accuracy_gsgd_rnn = np.mean(accuracies_gsgd_rnn)
+    best_accuracy_gsgd_rnn = np.max(accuracies_gsgd_rnn)
+    worst_accuracy_gsgd_rnn = np.min(accuracies_gsgd_rnn)
+
+    avg_accuracy_rnn = np.mean(accuracies_rnn)
+    best_accuracy_rnn = np.max(accuracies_rnn)
+    worst_accuracy_rnn = np.min(accuracies_rnn)
+
+    avg_accuracy_lstm = np.mean(accuracies_lstm)
+    best_accuracy_lstm = np.max(accuracies_lstm)
+    worst_accuracy_lstm = np.min(accuracies_lstm)
+
+    avg_f1_gsgd_rnn = np.mean(f1_scores_gsgd_rnn)
+    best_f1_gsgd_rnn = np.max(f1_scores_gsgd_rnn)
+    worst_f1_gsgd_rnn = np.min(f1_scores_gsgd_rnn)
+
+    avg_f1_rnn = np.mean(f1_scores_rnn)
+    best_f1_rnn = np.max(f1_scores_rnn)
+    worst_f1_rnn = np.min(f1_scores_rnn)
+
+    avg_f1_lstm = np.mean(f1_scores_lstm)
+    best_f1_lstm = np.max(f1_scores_lstm)
+    worst_f1_lstm = np.min(f1_scores_lstm)
+
+    avg_roc_auc_gsgd_rnn = np.mean(roc_aucs_gsgd_rnn)
+    best_roc_auc_gsgd_rnn = np.max(roc_aucs_gsgd_rnn)
+    worst_roc_auc_gsgd_rnn = np.min(roc_aucs_gsgd_rnn)
+
+    avg_roc_auc_rnn = np.mean(roc_aucs_rnn)
+    best_roc_auc_rnn = np.max(roc_aucs_rnn)
+    worst_roc_auc_rnn = np.min(roc_aucs_rnn)
+
+    avg_roc_auc_lstm = np.mean(roc_aucs_lstm)
+    best_roc_auc_lstm = np.max(roc_aucs_lstm)
+    worst_roc_auc_lstm = np.min(roc_aucs_lstm)
+
+    message = f'Average Accuracy for GSGD RNN: {avg_accuracy_gsgd_rnn * 100}%\n'
+    print(message)
+
+    message = f'Best Accuracy for GSGD RNN: {best_accuracy_gsgd_rnn * 100}%\n'
+    print(message)
+
+    message = f'Worst Accuracy for GSGD RNN: {worst_accuracy_gsgd_rnn * 100}%\n'
+    print(message)
+
+    message = f'Average Accuracy for RNN: {avg_accuracy_rnn * 100}%\n'
+    print(message)
+
+    message = f'Best Accuracy for RNN: {best_accuracy_rnn * 100}%\n'
+    print(message)
+
+    message = f'Worst Accuracy for RNN: {worst_accuracy_rnn * 100}%\n'
+    print(message)
+
+    message = f'Average Accuracy for LSTM: {avg_accuracy_lstm * 100}%\n'
+    print(message)
+
+    message = f'Best Accuracy for LSTM: {best_accuracy_lstm * 100}%\n'
+    print(message)
+
+    message = f'Worst Accuracy for LSTM: {worst_accuracy_lstm * 100}%\n'
+    print(message)
+
+    message = f'Average F1 Score for GSGD RNN: {avg_f1_gsgd_rnn}\n'
+    print(message)
+
+    message = f'Best F1 Score for GSGD RNN: {best_f1_gsgd_rnn}\n'
+    print(message)
+
+    message = f'Worst F1 Score for GSGD RNN: {worst_f1_gsgd_rnn}\n'
+    print(message)
+
+    message = f'Average F1 Score for RNN: {avg_f1_rnn}\n'
+    print(message)
+
+    message = f'Best F1 Score for RNN: {best_f1_rnn}\n'
+    print(message)
+
+    message = f'Worst F1 Score for RNN: {worst_f1_rnn}\n'
+    print(message)
+
+    message = f'Average F1 Score for LSTM: {avg_f1_lstm}\n'
+    print(message)
+
+    message = f'Best F1 Score for LSTM: {best_f1_lstm}\n'
+    print(message)
+
+    message = f'Worst F1 Score for LSTM: {worst_f1_lstm}\n'
+    print(message)
+
+    message = f'Average ROC-AUC Score for GSGD RNN: {avg_roc_auc_gsgd_rnn}\n'
+    print(message)
+
+    message = f'Best ROC-AUC Score for GSGD RNN: {best_roc_auc_gsgd_rnn}\n'
+    print(message)
+
+    message = f'Worst ROC-AUC Score for GSGD RNN: {worst_roc_auc_gsgd_rnn}\n'
+    print(message)
+
+    message = f'Average ROC-AUC Score for RNN: {avg_roc_auc_rnn}\n'
+    print(message)
+
+    message = f'Best ROC-AUC Score for RNN: {best_roc_auc_rnn}\n'
+    print(message)
+
+    message = f'Worst ROC-AUC Score for RNN: {worst_roc_auc_rnn}\n'
+    print(message)
+
+    message = f'Average ROC-AUC Score for LSTM: {avg_roc_auc_lstm}\n'
+    print(message)
+
+    message = f'Best ROC-AUC Score for LSTM: {best_roc_auc_lstm}\n'
+    print(message)
+
+    message = f'Worst ROC-AUC Score for LSTM: {worst_roc_auc_lstm}\n'
+    print(message)
+
+    results = {
+        'Model': ['GSGD RNN', 'RNN', 'LSTM'],
+        'Average Accuracy': [avg_accuracy_gsgd_rnn, avg_accuracy_rnn, avg_accuracy_lstm],
+        'Best Accuracy': [best_accuracy_gsgd_rnn, best_accuracy_rnn, best_accuracy_lstm],
+        'Worst Accuracy': [worst_accuracy_gsgd_rnn, worst_accuracy_rnn, worst_accuracy_lstm],
+        'Average F1 Score': [avg_f1_gsgd_rnn, avg_f1_rnn, avg_f1_lstm],
+        'Best F1 Score': [best_f1_gsgd_rnn, best_f1_rnn, best_f1_lstm],
+        'Worst F1 Score': [worst_f1_gsgd_rnn, worst_f1_rnn, worst_f1_lstm],
+        'Average ROC-AUC': [avg_roc_auc_gsgd_rnn, avg_roc_auc_rnn, avg_roc_auc_lstm],
+        'Best ROC-AUC': [best_roc_auc_gsgd_rnn, best_roc_auc_rnn, best_roc_auc_lstm],
+        'Worst ROC-AUC': [worst_roc_auc_gsgd_rnn, worst_roc_auc_rnn, worst_roc_auc_lstm]
+    }
+
+    save_results_to_csv(results, os.path.join(results_dir, 'results.csv'))
+    save_results_to_html(results, os.path.join(results_dir, 'results.html'))
+    plot_results_table(results, os.path.join(results_dir, 'results_table.png'))
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(actual_values, label='Actual', color='black')
+    plt.plot(np.mean(predictions_gsgd_rnn, axis=0), label='GSGD RNN', linestyle='dashed')
+    plt.plot(np.mean(predictions_rnn, axis=0), label='RNN', linestyle='dotted')
+    plt.plot(np.mean(predictions_lstm, axis=0), label='LSTM', linestyle='dashdot')
+    plt.legend()
+    plt.title('Actual vs. Average Predicted Stock Prices')
+    plt.xlabel('Time')
+    plt.ylabel('Stock Price')
+    plt.savefig(os.path.join(results_dir, 'actual_vs_predicted.png'))
+    plt.show()
+
+    avg_train_losses = np.mean(padded_train_losses, axis=0)
+    avg_val_losses = np.mean(padded_val_losses, axis=0)
+    plt.figure(figsize=(12, 6))
+    plt.plot(avg_train_losses, label='Training Loss')
+    plt.plot(avg_val_losses, label='Validation Loss', linestyle='--')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Average Training and Validation Loss')
+    plt.legend()
+    plt.savefig(os.path.join(results_dir, 'loss_curve.png'))
+    plt.show()
+
+    y_test_binary = (actual_values > actual_values.mean()).astype(int)
+    pred_gsgd_rnn_binary = (np.mean(predictions_gsgd_rnn, axis=0) > actual_values.mean()).astype(int)
+    pred_rnn_binary = (np.mean(predictions_rnn, axis=0) > actual_values.mean()).astype(int)
+    pred_lstm_binary = (np.mean(predictions_lstm, axis=0) > actual_values.mean()).astype(int)
+
+    plt.figure(figsize=(12, 6))
+    roc_auc_gsgd_rnn = plot_roc_curve(y_test_binary, np.mean(predictions_gsgd_rnn, axis=0), label='GSGD RNN')
+    roc_auc_rnn = plot_roc_curve(y_test_binary, np.mean(predictions_rnn, axis=0), label='RNN')
+    roc_auc_lstm = plot_roc_curve(y_test_binary, np.mean(predictions_lstm, axis=0), label='LSTM')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend(loc='best')
+    plt.savefig(os.path.join(results_dir, 'roc_curve.png'))
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
